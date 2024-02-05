@@ -51,6 +51,8 @@ var (
 	enableCache = flag.Bool("enable-daemon-image-credential-cache", true,
 		"Whether to save contents of imagepullsecrets of the daemon ServiceAccount in memory. "+
 			"If set to false, secrets will be fetched from the API server on every image pull.")
+	asyncImagePullTimeout = flag.Duration("async-pull-timeout", 0,
+		"If positive, specifies duration allotted for async image pulls as measured from pull start time. If zero, negative, less than 30s, or omitted, the caller's timeout (usually kubelet: 2m) is used instead of this value. (additional time helps prevent timeout for larger images or slower image pull conditions)")
 	watcherResyncPeriod = flag.Duration("watcher-resync-period", 30*time.Minute, "The resync period of the pvc watcher.")
 	mode                = flag.String("mode", "", "The mode of the driver. Valid values are: node, controller")
 	nodePluginSA        = flag.String("node-plugin-sa", "csi-image-warm-metal", "The name of the ServiceAccount used by the node plugin.")
@@ -122,10 +124,12 @@ func main() {
 			klog.Fatalf(`unable to connect to cri daemon "%s": %s`, *endpoint, err)
 		}
 
+		secretStore := secret.CreateStoreOrDie(*icpConf, *icpBin, *nodePluginSA, *enableCache)
+
 		server.Start(*endpoint,
 			NewIdentityServer(driverVersion),
 			nil,
-			NewNodeServer(driver, mounter, criClient, secret.CreateStoreOrDie(*icpConf, *icpBin, *nodePluginSA, *enableCache)))
+			NewNodeServer(driver, mounter, criClient, secretStore, *asyncImagePullTimeout))
 	case controllerMode:
 		watcher, err := watcher.New(context.Background(), *watcherResyncPeriod)
 		if err != nil {

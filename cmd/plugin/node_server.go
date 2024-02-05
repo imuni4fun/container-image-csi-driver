@@ -4,11 +4,13 @@ import (
 	"context"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/containerd/containerd/reference/docker"
 	"github.com/warm-metal/csi-driver-image/pkg/backend"
 	"github.com/warm-metal/csi-driver-image/pkg/remoteimage"
+	"github.com/warm-metal/csi-driver-image/pkg/remoteimageasync"
 	"github.com/warm-metal/csi-driver-image/pkg/secret"
 	csicommon "github.com/warm-metal/csi-drivers/pkg/csi-common"
 	"google.golang.org/grpc/codes"
@@ -25,20 +27,31 @@ const (
 	ctxKeyEphemeralVolume = "csi.storage.k8s.io/ephemeral"
 )
 
-func NewNodeServer(driver *csicommon.CSIDriver, mounter *backend.SnapshotMounter, imageSvc cri.ImageServiceClient, secretStore secret.Store) *NodeServer {
-	return &NodeServer{
-		DefaultNodeServer: csicommon.NewDefaultNodeServer(driver),
-		mounter:           mounter,
-		imageSvc:          imageSvc,
-		secretStore:       secretStore,
+type ImagePullStatus int
+
+func NewNodeServer(driver *csicommon.CSIDriver, mounter *backend.SnapshotMounter, imageSvc cri.ImageServiceClient, secretStore secret.Store, asyncImagePullTimeout time.Duration) *NodeServer {
+	ns := NodeServer{
+		DefaultNodeServer:     csicommon.NewDefaultNodeServer(driver),
+		mounter:               mounter,
+		secretStore:           secretStore,
+		asyncImagePullTimeout: asyncImagePullTimeout,
+		asyncImagePuller:      nil,
 	}
+	if asyncImagePullTimeout >= time.Duration(30*time.Second) {
+		ns.asyncImagePuller = remoteimageasync.StartAsyncPuller(context.TODO(), 100, 20)
+	} else {
+		ns.asyncImagePullTimeout = 0 // set to default value
+	}
+	return &ns
 }
 
 type NodeServer struct {
 	*csicommon.DefaultNodeServer
-	mounter     *backend.SnapshotMounter
-	imageSvc    cri.ImageServiceClient
-	secretStore secret.Store
+	mounter               *backend.SnapshotMounter
+	imageSvc              cri.ImageServiceClient
+	secretStore           secret.Store
+	asyncImagePullTimeout time.Duration
+	asyncImagePuller      remoteimageasync.AsyncPuller
 }
 
 func (n NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (resp *csi.NodePublishVolumeResponse, err error) {
@@ -117,12 +130,29 @@ func (n NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishV
 		return
 	}
 
-	puller := remoteimage.NewPuller(n.imageSvc, namedRef, keyring)
+	//NOTE: we are relying on n.mounter.ImageExists() to return false when
+	//      a first-time pull is in progress, else this logic may not be
+	//      correct. should test this.
 	if pullAlways || !n.mounter.ImageExists(ctx, namedRef) {
 		klog.Errorf("pull image %q", image)
-		if err = puller.Pull(ctx); err != nil {
-			err = status.Errorf(codes.Aborted, "unable to pull image %q: %s", image, err)
-			return
+		puller := remoteimage.NewPuller(n.imageSvc, namedRef, keyring)
+
+		if n.asyncImagePuller != nil {
+			var session remoteimageasync.PullSession
+			session, err = n.asyncImagePuller.StartPull(image, puller, n.asyncImagePullTimeout)
+			if err != nil {
+				err = status.Errorf(codes.Aborted, "unable to pull image %q: %s", image, err)
+				return
+			}
+			if err = n.asyncImagePuller.WaitForPull(session, ctx); err != nil {
+				err = status.Errorf(codes.Aborted, "unable to pull image %q: %s", image, err)
+				return
+			}
+		} else {
+			if err = puller.Pull(ctx); err != nil {
+				err = status.Errorf(codes.Aborted, "unable to pull image %q: %s", image, err)
+				return
+			}
 		}
 	}
 
